@@ -1,0 +1,842 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+# ============================================================
+# repair-vid.sh
+#
+# Usage:
+#   ./repair-vid.sh ./broken.mkv
+#   ./repair-vid.sh ./broken.mp4
+#
+# Strategy:
+#
+#   1. Analyse source
+#   2. FFmpeg lossless remux
+#   3. Alternative MKVToolNix remux (Matroska only)
+#   4. Deep lossless track extraction with mkvextract
+#   5. Ask before ANY re-encoding
+#   6. Aggressive decode/re-encode
+#   7. Optional re-encode from raw extracted HEVC
+#
+# The original file is NEVER modified.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
+die()
+{
+    echo
+    echo "ERROR: $*"
+    echo
+    exit 1
+}
+
+
+count_log_errors()
+{
+    local logfile="$1"
+
+    [[ -f "$logfile" ]] || return
+
+    local ebml
+    local poc
+    local nalu
+    local corrupt
+
+    ebml=$(grep -c "invalid as first byte of an EBML" "$logfile" 2>/dev/null || true)
+    poc=$(grep -c "Could not find ref with POC" "$logfile" 2>/dev/null || true)
+    nalu=$(grep -c "Skipping invalid undecodable NALU" "$logfile" 2>/dev/null || true)
+    corrupt=$(grep -ci "corrupt" "$logfile" 2>/dev/null || true)
+
+    echo
+    echo "Detected while processing:"
+    echo "  EBML errors:             $ebml"
+    echo "  Missing HEVC references: $poc"
+    echo "  Invalid NAL units:       $nalu"
+    echo "  Other 'corrupt' entries: $corrupt"
+}
+
+
+probe_file()
+{
+    local file="$1"
+
+    echo
+    echo "File:"
+    echo "  $file"
+
+    ffprobe \
+        -v error \
+        -show_entries \
+        format=format_name,duration,size,bit_rate \
+        -of default=noprint_wrappers=1 \
+        "$file" \
+        2>/dev/null || true
+}
+
+
+run_ffmpeg()
+{
+    local logfile="$1"
+    shift
+
+    echo "  log: $logfile"
+    echo
+
+    ffmpeg \
+        -hide_banner \
+        -nostats \
+        -progress pipe:1 \
+        "$@" \
+        2>"$logfile" |
+    awk -F= '
+        /^out_time=/ {
+            printf "\r  processed: %s", $2
+            fflush()
+        }
+
+        END {
+            printf "\n"
+        }
+    '
+
+    return "${PIPESTATUS[0]}"
+}
+
+
+# ------------------------------------------------------------
+# Arguments
+# ------------------------------------------------------------
+
+[[ $# -eq 1 ]] || {
+    echo "Usage:"
+    echo "  $0 <video-file>"
+    echo
+    echo "Example:"
+    echo "  $0 ./broken.mkv"
+    exit 1
+}
+
+INPUT="$1"
+
+[[ -f "$INPUT" ]] || die "File does not exist: $INPUT"
+
+
+# ------------------------------------------------------------
+# Dependencies
+# ------------------------------------------------------------
+
+command -v ffmpeg >/dev/null 2>&1 ||
+    die "ffmpeg is not installed."
+
+command -v ffprobe >/dev/null 2>&1 ||
+    die "ffprobe is not installed."
+
+
+# ------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------
+
+DIR="$(dirname "$INPUT")"
+FILE="$(basename "$INPUT")"
+
+if [[ "$FILE" == *.* ]]; then
+    NAME="${FILE%.*}"
+else
+    NAME="$FILE"
+fi
+
+REMUX="${DIR}/${NAME}.repair-remux.mkv"
+MKV_REMUX="${DIR}/${NAME}.repair-mkvtoolnix.mkv"
+
+RAW_VIDEO="${DIR}/${NAME}.repair-raw-video.hevc"
+
+REENCODE="${DIR}/${NAME}.repair-reencoded.mkv"
+RAW_REENCODE="${DIR}/${NAME}.repair-raw-reencoded.mkv"
+
+LOG_DIR="${DIR}/${NAME}.repair-logs"
+
+mkdir -p "$LOG_DIR"
+
+PROBE_LOG="${LOG_DIR}/probe.txt"
+REMUX_LOG="${LOG_DIR}/ffmpeg-remux.log"
+MKVMERGE_LOG="${LOG_DIR}/mkvmerge.log"
+MKVEXTRACT_LOG="${LOG_DIR}/mkvextract.log"
+REENCODE_LOG="${LOG_DIR}/ffmpeg-reencode.log"
+RAW_REENCODE_LOG="${LOG_DIR}/ffmpeg-raw-reencode.log"
+CLUSTER_LOG="${LOG_DIR}/matroska-clusters.txt"
+
+
+# ------------------------------------------------------------
+# Source information
+# ------------------------------------------------------------
+
+FORMAT="$(
+    ffprobe \
+        -v error \
+        -show_entries format=format_name \
+        -of default=noprint_wrappers=1:nokey=1 \
+        "$INPUT" \
+        2>/dev/null || true
+)"
+
+VIDEO_CODEC="$(
+    ffprobe \
+        -v error \
+        -select_streams v:0 \
+        -show_entries stream=codec_name \
+        -of default=noprint_wrappers=1:nokey=1 \
+        "$INPUT" \
+        2>/dev/null || true
+)"
+
+FPS="$(
+    ffprobe \
+        -v error \
+        -select_streams v:0 \
+        -show_entries stream=avg_frame_rate \
+        -of default=noprint_wrappers=1:nokey=1 \
+        "$INPUT" \
+        2>/dev/null || true
+)"
+
+IS_MATROSKA=0
+
+if [[ "$FORMAT" == *matroska* ]] || [[ "$FORMAT" == *webm* ]]; then
+    IS_MATROSKA=1
+fi
+
+
+# ------------------------------------------------------------
+# Header
+# ------------------------------------------------------------
+
+echo
+echo "============================================================"
+echo " VIDEO RECOVERY"
+echo "============================================================"
+echo
+echo "Source:"
+echo "  $INPUT"
+echo
+echo "Container:"
+echo "  ${FORMAT:-unknown}"
+echo
+echo "Video codec:"
+echo "  ${VIDEO_CODEC:-unknown}"
+echo
+echo "Frame rate:"
+echo "  ${FPS:-unknown}"
+echo
+echo "Original file will NOT be modified."
+echo
+
+
+# ------------------------------------------------------------
+# Full probe
+# ------------------------------------------------------------
+
+echo "============================================================"
+echo "[1] ANALYSIS"
+echo "============================================================"
+
+ffprobe \
+    -hide_banner \
+    "$INPUT" \
+    >"$PROBE_LOG" 2>&1 || true
+
+probe_file "$INPUT"
+
+echo
+echo "Full probe saved to:"
+echo "  $PROBE_LOG"
+
+
+# ------------------------------------------------------------
+# Lossless FFmpeg remux
+#
+# IMPORTANT:
+# There is intentionally NO:
+#
+#   -fflags +discardcorrupt
+#
+# We want to preserve as much material as FFmpeg will accept.
+# ------------------------------------------------------------
+
+echo
+echo "============================================================"
+echo "[2] LOSSLESS FFMPEG REMUX"
+echo "============================================================"
+echo
+echo "No video or audio re-encoding."
+echo "Corrupt packets are NOT deliberately discarded."
+echo
+
+rm -f "$REMUX"
+
+run_ffmpeg "$REMUX_LOG" \
+    -fflags +genpts \
+    -err_detect ignore_err \
+    -i "$INPUT" \
+    -map 0:v? \
+    -map 0:a? \
+    -map 0:s? \
+    -c copy \
+    -y \
+    "$REMUX"
+
+REMUX_RESULT=$?
+
+if [[ $REMUX_RESULT -eq 0 ]] && [[ -s "$REMUX" ]]; then
+
+    echo
+    echo "✓ FFmpeg remux completed."
+
+    probe_file "$REMUX"
+
+else
+
+    echo
+    echo "✗ FFmpeg remux failed."
+
+    rm -f "$REMUX"
+
+fi
+
+count_log_errors "$REMUX_LOG"
+
+
+# ------------------------------------------------------------
+# Alternative parser: MKVToolNix
+# ------------------------------------------------------------
+
+if [[ $IS_MATROSKA -eq 1 ]]; then
+
+    echo
+    echo "============================================================"
+    echo "[3] MATROSKA ALTERNATIVE PARSER"
+    echo "============================================================"
+
+    if command -v mkvmerge >/dev/null 2>&1; then
+
+        echo
+        echo "Trying MKVToolNix instead of FFmpeg."
+        echo "This is also lossless."
+        echo
+
+        rm -f "$MKV_REMUX"
+
+        mkvmerge \
+            -o "$MKV_REMUX" \
+            "$INPUT" \
+            >"$MKVMERGE_LOG" 2>&1
+
+        MKV_RESULT=$?
+
+        if [[ $MKV_RESULT -eq 0 ]] && [[ -s "$MKV_REMUX" ]]; then
+
+            echo "✓ MKVToolNix remux completed."
+
+            probe_file "$MKV_REMUX"
+
+        else
+
+            echo "✗ MKVToolNix could not cleanly remux the file."
+
+            rm -f "$MKV_REMUX"
+
+        fi
+
+        echo
+        echo "Log:"
+        echo "  $MKVMERGE_LOG"
+
+    else
+
+        echo
+        echo "mkvmerge is not installed."
+        echo
+        echo "Optional installation:"
+        echo
+        echo "  sudo apt install mkvtoolnix"
+
+    fi
+
+else
+
+    echo
+    echo "============================================================"
+    echo "[3] MATROSKA RECOVERY"
+    echo "============================================================"
+    echo
+    echo "Skipped: input is not detected as Matroska/WebM."
+
+fi
+
+
+# ------------------------------------------------------------
+# Matroska cluster scan
+#
+# This does NOT repair anything by itself.
+# It searches the raw file for the Matroska Cluster ID:
+#
+#   1F 43 B6 75
+#
+# Useful to see whether later clusters remain present even when
+# container metadata between them is damaged.
+# ------------------------------------------------------------
+
+if [[ $IS_MATROSKA -eq 1 ]] && command -v python3 >/dev/null 2>&1; then
+
+    echo
+    echo "============================================================"
+    echo "[4] RAW MATROSKA CLUSTER SCAN"
+    echo "============================================================"
+    echo
+
+    python3 - "$INPUT" "$CLUSTER_LOG" <<'PYTHON'
+import sys
+
+filename = sys.argv[1]
+output   = sys.argv[2]
+
+needle = b"\x1f\x43\xb6\x75"
+
+chunk_size = 16 * 1024 * 1024
+
+positions = []
+
+with open(filename, "rb") as f:
+    offset = 0
+    overlap = b""
+
+    while True:
+        chunk = f.read(chunk_size)
+
+        if not chunk:
+            break
+
+        data = overlap + chunk
+
+        start = 0
+
+        while True:
+            pos = data.find(needle, start)
+
+            if pos == -1:
+                break
+
+            absolute = offset - len(overlap) + pos
+
+            positions.append(absolute)
+
+            start = pos + 1
+
+        overlap = data[-3:]
+        offset += len(chunk)
+
+with open(output, "w") as f:
+    for pos in positions:
+        f.write(f"{pos}\t0x{pos:x}\n")
+
+print(f"Found {len(positions)} possible Matroska clusters.")
+
+if positions:
+    print(f"First cluster: {positions[0]} (0x{positions[0]:x})")
+    print(f"Last cluster:  {positions[-1]} (0x{positions[-1]:x})")
+PYTHON
+
+    echo
+    echo "Cluster positions saved to:"
+    echo "  $CLUSTER_LOG"
+
+else
+
+    echo
+    echo "============================================================"
+    echo "[4] RAW MATROSKA CLUSTER SCAN"
+    echo "============================================================"
+    echo
+    echo "Skipped."
+
+fi
+
+
+# ------------------------------------------------------------
+# Deep Matroska extraction
+#
+# This is still LOSSLESS.
+#
+# mkvextract --parse-fully walks the entire file instead of
+# relying only on normal Matroska indexing.
+# ------------------------------------------------------------
+
+RAW_VIDEO_OK=0
+
+if [[ $IS_MATROSKA -eq 1 ]]; then
+
+    echo
+    echo "============================================================"
+    echo "[5] DEEP LOSSLESS TRACK EXTRACTION"
+    echo "============================================================"
+    echo
+
+    if command -v mkvextract >/dev/null 2>&1 &&
+       command -v mkvmerge >/dev/null 2>&1; then
+
+        VIDEO_TRACK_ID="$(
+            mkvmerge -i "$INPUT" 2>/dev/null |
+            sed -n 's/^Track ID \([0-9][0-9]*\): video.*/\1/p' |
+            head -n 1
+        )"
+
+        if [[ -n "${VIDEO_TRACK_ID:-}" ]]; then
+
+            case "$VIDEO_CODEC" in
+
+                hevc)
+                    RAW_VIDEO="${DIR}/${NAME}.repair-raw-video.hevc"
+                    ;;
+
+                h264)
+                    RAW_VIDEO="${DIR}/${NAME}.repair-raw-video.h264"
+                    ;;
+
+                *)
+                    RAW_VIDEO="${DIR}/${NAME}.repair-raw-video.bin"
+                    ;;
+
+            esac
+
+            echo "Video track ID:"
+            echo "  $VIDEO_TRACK_ID"
+            echo
+            echo "Extracting the raw encoded video stream..."
+            echo
+
+            rm -f "$RAW_VIDEO"
+
+            mkvextract \
+                --parse-fully \
+                "$INPUT" \
+                tracks \
+                "${VIDEO_TRACK_ID}:${RAW_VIDEO}" \
+                >"$MKVEXTRACT_LOG" 2>&1
+
+            EXTRACT_RESULT=$?
+
+            if [[ $EXTRACT_RESULT -eq 0 ]] && [[ -s "$RAW_VIDEO" ]]; then
+
+                RAW_VIDEO_OK=1
+
+                echo "✓ Raw video extraction completed."
+                echo
+                echo "Raw stream:"
+                echo "  $RAW_VIDEO"
+                echo
+                echo "Size:"
+                du -h "$RAW_VIDEO" 2>/dev/null || true
+
+            else
+
+                echo "✗ Raw track extraction failed."
+
+                rm -f "$RAW_VIDEO"
+
+            fi
+
+        else
+
+            echo "Could not determine the Matroska video track ID."
+
+        fi
+
+        echo
+        echo "Extraction log:"
+        echo "  $MKVEXTRACT_LOG"
+
+    else
+
+        echo "mkvextract/mkvmerge not installed."
+        echo
+        echo "Install with:"
+        echo
+        echo "  sudo apt install mkvtoolnix"
+
+    fi
+
+else
+
+    echo
+    echo "============================================================"
+    echo "[5] DEEP LOSSLESS TRACK EXTRACTION"
+    echo "============================================================"
+    echo
+    echo "Skipped: not a Matroska/WebM source."
+
+fi
+
+
+# ------------------------------------------------------------
+# Lossless phase finished
+# ------------------------------------------------------------
+
+echo
+echo "============================================================"
+echo " LOSSLESS RECOVERY FINISHED"
+echo "============================================================"
+echo
+
+[[ -f "$REMUX" ]] &&
+    echo "FFmpeg remux:      $REMUX"
+
+[[ -f "$MKV_REMUX" ]] &&
+    echo "MKVToolNix remux:  $MKV_REMUX"
+
+[[ $RAW_VIDEO_OK -eq 1 ]] &&
+    echo "Raw video stream:  $RAW_VIDEO"
+
+echo
+echo "No video has been re-encoded yet."
+echo
+
+
+# ------------------------------------------------------------
+# Ask before lossy processing
+# ------------------------------------------------------------
+
+read -r -p "Attempt aggressive video re-encoding? [y/N] " ANSWER
+
+case "$ANSWER" in
+
+    y|Y|yes|YES|Yes|j|J|ja|JA|Ja)
+        ;;
+
+    *)
+        echo
+        echo "Lossy recovery skipped."
+        echo
+        echo "Logs are stored in:"
+        echo "  $LOG_DIR"
+        echo
+        exit 0
+        ;;
+
+esac
+
+
+# ------------------------------------------------------------
+# Aggressive re-encoding
+#
+# Key differences from old script:
+#
+#   NO discardcorrupt
+#
+#   +output_corrupt asks the decoder to output damaged frames
+#   when it can, rather than automatically throwing them away.
+#
+# Audio is copied losslessly.
+# ------------------------------------------------------------
+
+echo
+echo "============================================================"
+echo "[6] AGGRESSIVE VIDEO RECOVERY"
+echo "============================================================"
+echo
+echo "Video will now be decoded and encoded as H.264."
+echo
+echo "Audio will be copied without re-encoding."
+echo
+echo "Damaged decoded frames are retained when possible."
+echo
+
+rm -f "$REENCODE"
+
+run_ffmpeg "$REENCODE_LOG" \
+    -fflags +genpts \
+    -err_detect ignore_err \
+    -flags +output_corrupt \
+    -i "$INPUT" \
+    -map 0:v:0? \
+    -map 0:a? \
+    -map 0:s? \
+    -c:v libx264 \
+    -threads 0 \
+    -preset medium \
+    -crf 18 \
+    -c:a copy \
+    -c:s copy \
+    -y \
+    "$REENCODE"
+
+REENCODE_RESULT=$?
+
+if [[ $REENCODE_RESULT -eq 0 ]] && [[ -s "$REENCODE" ]]; then
+
+    echo
+    echo "✓ Aggressive re-encoding completed."
+
+    probe_file "$REENCODE"
+
+else
+
+    echo
+    echo "✗ Direct aggressive re-encoding failed."
+
+    rm -f "$REENCODE"
+
+fi
+
+count_log_errors "$REENCODE_LOG"
+
+
+# ------------------------------------------------------------
+# Re-encode raw extracted video
+#
+# This bypasses Matroska entirely.
+#
+# Particularly useful when:
+#
+#     Matroska container structure is corrupt
+#
+# but:
+#
+#     large portions of the HEVC elementary stream survived.
+#
+# Result is VIDEO ONLY because raw extraction removes the
+# Matroska timing/audio relationship.
+# ------------------------------------------------------------
+
+if [[ $RAW_VIDEO_OK -eq 1 ]] &&
+   [[ "$VIDEO_CODEC" == "hevc" || "$VIDEO_CODEC" == "h264" ]]; then
+
+    echo
+    echo "============================================================"
+    echo "[7] CONTAINER-BYPASS RECOVERY"
+    echo "============================================================"
+    echo
+    echo "A raw video stream was successfully extracted."
+    echo
+    echo "This pass ignores the broken Matroska container completely."
+    echo
+    echo "Output will be VIDEO ONLY."
+    echo
+
+    VALID_FPS=0
+
+    if [[ -n "${FPS:-}" ]] &&
+       [[ "$FPS" != "0/0" ]] &&
+       [[ "$FPS" != "N/A" ]]; then
+
+        VALID_FPS=1
+
+    fi
+
+    if [[ $VALID_FPS -eq 1 ]]; then
+
+        echo "Using original detected frame rate:"
+        echo "  $FPS"
+        echo
+
+        rm -f "$RAW_REENCODE"
+
+        run_ffmpeg "$RAW_REENCODE_LOG" \
+            -fflags +genpts \
+            -err_detect ignore_err \
+            -flags +output_corrupt \
+            -r "$FPS" \
+            -i "$RAW_VIDEO" \
+            -map 0:v:0 \
+            -c:v libx264 \
+            -threads 0 \
+            -preset medium \
+            -crf 18 \
+            -an \
+            -y \
+            "$RAW_REENCODE"
+
+        RAW_RESULT=$?
+
+        if [[ $RAW_RESULT -eq 0 ]] &&
+           [[ -s "$RAW_REENCODE" ]]; then
+
+            echo
+            echo "✓ Raw-stream recovery completed."
+
+            probe_file "$RAW_REENCODE"
+
+        else
+
+            echo
+            echo "✗ Raw-stream recovery failed."
+
+            rm -f "$RAW_REENCODE"
+
+        fi
+
+        count_log_errors "$RAW_REENCODE_LOG"
+
+    else
+
+        echo "Could not reliably determine the source frame rate."
+        echo
+        echo "Raw re-encoding was therefore skipped instead of guessing."
+
+    fi
+
+fi
+
+
+# ------------------------------------------------------------
+# Final result
+# ------------------------------------------------------------
+
+echo
+echo "============================================================"
+echo " RECOVERY COMPLETE"
+echo "============================================================"
+echo
+echo "Original:"
+echo "  $INPUT"
+echo
+
+if [[ -f "$REMUX" ]]; then
+    echo "Lossless FFmpeg remux:"
+    echo "  $REMUX"
+    echo
+fi
+
+if [[ -f "$MKV_REMUX" ]]; then
+    echo "Lossless MKVToolNix remux:"
+    echo "  $MKV_REMUX"
+    echo
+fi
+
+if [[ $RAW_VIDEO_OK -eq 1 ]]; then
+    echo "Losslessly extracted raw stream:"
+    echo "  $RAW_VIDEO"
+    echo
+fi
+
+if [[ -f "$REENCODE" ]]; then
+    echo "Aggressively recovered video:"
+    echo "  $REENCODE"
+    echo
+fi
+
+if [[ -f "$RAW_REENCODE" ]]; then
+    echo "Container-bypass recovered video:"
+    echo "  $RAW_REENCODE"
+    echo
+fi
+
+echo "Logs:"
+echo "  $LOG_DIR"
+echo
+echo "The original file has not been changed."
+echo
